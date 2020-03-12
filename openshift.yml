@@ -8,6 +8,9 @@
     network_security_group: "{{ hostvars[groups['vps'][0]].instance_nsg }}"
     instance: "{{ hostvars[groups['vps'][0]].instance }}"
     resource_group: "{{ hostvars[groups['vps'][0]].instance_rg }}"
+    security_group: "{{ hostvars[groups['vps'][0]].instance_sg }}"
+    security_group_id: "{{ hostvars[groups['vps'][0]].instance_sg_id }}"
+    virtual_private_cloud_id: "{{ hostvars[groups['vps'][0]].instance_vpc_id }}"
     openshift_directory: /home/ubuntu/.local/etc/openshift
     ansible_python_interpreter: /usr/bin/python3
 
@@ -21,17 +24,18 @@
       register: openshift_dir
       tags: [ 'destroy' ]
 
-    - name: Open Firewall Ports
+    - name: Open Firewall Ports (AWS Lightsail)
       delegate_to: localhost
       args:
         executable: /bin/bash
       script: "./scripts/firewall.sh open {{ instance }}"
       when:
         - "'instance_nsg' not in hostvars[groups['vps'][0]]"
+        - "'instance_sg' not in hostvars[groups['vps'][0]]"
         - "'docker' in services"
         - openshift_dir.stat.exists == False
 
-    - name: Add Network Security Group rules
+    - name: Add Network Security Group rules (Microsoft Azure VM)
       delegate_to: localhost
       azure_rm_securitygroup:
         name: "{{ network_security_group }}"
@@ -67,8 +71,41 @@
         state: present
       when:
         - "'instance_nsg' in hostvars[groups['vps'][0]]"
+        - "'instance_sg' not in hostvars[groups['vps'][0]]"
         - "'docker' in services"
         - openshift_dir.stat.exists == False
+
+    - name: Add Security Group rules (AWS EC2)
+      delegate_to: localhost
+      ec2_group:
+        name: "{{ security_group }}"
+        description: OpenShift
+        vpc_id: "{{ virtual_private_cloud_id }}"
+        purge_rules: no
+        rules:
+         - proto: tcp
+           ports:
+             - 80
+             - 443
+             - 1936
+             - 4001
+             - 7001
+             - 8443
+             - 10250-10259
+           cidr_ip: 0.0.0.0/0
+           rule_desc: OpenShift-Tcp
+         - proto: udp
+           ports:
+             - 53
+             - 8053
+           cidr_ip: 0.0.0.0/0
+           rule_desc: OpenShift-Udp
+       state: present
+     when:
+       - "'instance_nsg' not in hostvars[groups['vps'][0]]"
+       - "'instance_sg' in hostvars[groups['vps'][0]]"
+       - "'docker' in services"
+       - openshift_dir.stat.exists == False
 
     - name: Copy and Run install
       environment:
@@ -92,23 +129,48 @@
         PATH: "{{ ansible_env.PATH}}:{{ openshift_directory }}/../../bin"
       args:
         executable: /bin/bash
-      shell: "cd {{ openshift_directory }} && oc cluster down && cd ../ && rm -r {{ openshift_directory }}/../../../.kube {{ openshift_directory }}"
+      shell:
+        "cd {{ openshift_directory }} && oc cluster down && cd ../ && rm -r {{ openshift_directory }}/../../../.kube {{ openshift_directory }}"
+      when: openshift_dir.stat.exists == True
       tags: [ 'never', 'destroy' ]
 
-    - name: Close Firewall Ports
+    - name: Close Firewall Ports (AWS Lightsail)
       delegate_to: localhost
       args:
         executable: /bin/bash
       script: "./scripts/firewall.sh close {{ instance }}"
-      when: "'instance_nsg' not in hostvars[groups['vps'][0]]"
+      when:
+        - "'instance_nsg' not in hostvars[groups['vps'][0]]"
+        - "'instance_sg' not in hostvars[groups['vps'][0]]"
       tags: [ 'never', 'destroy' ]
 
-    - name: Delete Network Security Group rules
+    - name: Delete Network Security Group rules (Microsoft Azure VM)
       delegate_to: localhost
       command:
         bash -ic "az-login-sp && (az network nsg rule delete -g {{ resource_group }} --nsg-name {{ network_security_group }} -n {{ item }})"
       with_items:
         - OpenShift-Tcp
         - OpenShift-Udp
-      when: "'instance_nsg' in hostvars[groups['vps'][0]]"
+      when:
+        - "'instance_nsg' in hostvars[groups['vps'][0]]"
+        - "'instance_sg' not in hostvars[groups['vps'][0]]"
+      tags: [ 'never', 'destroy' ]
+
+    - name: Delete Security Group rules (AWS EC2)
+      delegate_to: localhost
+      command:
+        bash -c "[[ {{ item }} -eq 53 || {{ item }} -eq 8053 ]] && protocol=udp || protocol=tcp && aws ec2 revoke-security-group-ingress --group-id {{ security_group_id }} --port {{ item }} --protocol $protocol --cidr 0.0.0.0/0"
+      with_items:
+        - 80
+        - 443
+        - 1936
+        - 4001
+        - 7001
+        - 8443
+        - 10250-10259
+        - 53
+        - 8053
+      when:
+        - "'instance_nsg' not in hostvars[groups['vps'][0]]"
+        - "'instance_sg' in hostvars[groups['vps'][0]]"
       tags: [ 'never', 'destroy' ]
