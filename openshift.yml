@@ -1,0 +1,53 @@
+# Install, initialize OpenShift Origin and create a destroy routine for it
+---
+- hosts: vps
+  connection: local
+
+  vars:
+    openshift_directory: /home/ubuntu/.local/etc/openshift
+
+  tasks:
+    - name: Discover Services
+      service_facts:
+
+    - name: Check if openshift directory exists
+      stat:
+        path: "{{ openshift_directory }}"
+      register: openshift_dir
+
+    - name: Open Firewall Ports
+      delegate_to: localhost
+      command: bash -c './scripts/firewall.sh open {{ hostvars[groups['vps'][0]].instance }}'
+      when:
+        - "'docker' in services"
+        - openshift_dir.stat.exists == False
+
+    - name: Copy and Run install
+      environment:
+        PATH: "{{ ansible_env.PATH}}:{{ openshift_directory }}/../../bin"
+      args:
+        executable: /bin/bash
+      script: "./scripts/install.sh {{ ansible_ssh_host }}"
+      when:
+        - "'docker' in services"
+        - openshift_dir.stat.exists == False
+
+    - debug: msg="Please install docker to proceed."
+      when: "'docker' not in services"
+
+    - debug: msg="Install script has already been completed.  Run this playbook with the destroy tag, then run once again normally to re-intialize openshift."
+      when: openshift_dir.stat.exists == True
+
+    - name: Destroy
+      become: yes
+      environment:
+        PATH: "{{ ansible_env.PATH}}:{{ openshift_directory }}/../../bin"
+      args:
+        executable: /bin/bash
+      shell: "cd {{ openshift_directory }} && oc cluster down && cd ../ && rm -r {{ openshift_directory }}/../../../.kube {{ openshift_directory }}"
+      tags: [ 'never', 'destroy' ]
+
+    - name: Close Firewall Ports
+      delegate_to: localhost
+      command: bash -c './scripts/firewall.sh close {{ hostvars[groups['vps'][0]].instance }}'
+      tags: [ 'never', 'destroy' ]
