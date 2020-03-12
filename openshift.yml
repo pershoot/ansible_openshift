@@ -1,10 +1,15 @@
 # Install, initialize OpenShift Origin and create a destroy routine for it
+# This is a unified setup against AWS Lightsail and Microsoft Azure VM
 ---
 - hosts: vps
   connection: local
 
   vars:
+    network_security_group: "{{ hostvars[groups['vps'][0]].instance_nsg }}"
+    instance: "{{ hostvars[groups['vps'][0]].instance }}"
+    resource_group: "{{ hostvars[groups['vps'][0]].instance_rg }}"
     openshift_directory: /home/ubuntu/.local/etc/openshift
+    ansible_python_interpreter: /usr/bin/python3
 
   tasks:
     - name: Discover Services
@@ -14,11 +19,54 @@
       stat:
         path: "{{ openshift_directory }}"
       register: openshift_dir
+      tags: [ 'destroy' ]
 
     - name: Open Firewall Ports
       delegate_to: localhost
-      command: bash -c './scripts/firewall.sh open {{ hostvars[groups['vps'][0]].instance }}'
+      args:
+        executable: /bin/bash
+      script: "./scripts/firewall.sh open {{ instance }}"
       when:
+        - "'instance_nsg' not in hostvars[groups['vps'][0]]"
+        - "'docker' in services"
+        - openshift_dir.stat.exists == False
+
+    - name: Add Network Security Group rules
+      delegate_to: localhost
+      azure_rm_securitygroup:
+        name: "{{ network_security_group }}"
+        resource_group: "{{ resource_group }}"
+        rules:
+          - name: OpenShift-Tcp
+            priority: 1002
+            direction: Inbound
+            access: Allow
+            protocol: Tcp
+            source_port_range: "*"
+            destination_port_range:
+              - 80
+              - 443
+              - 1936
+              - 4001
+              - 7001
+              - 8443
+              - 10250-10259
+            source_address_prefix: "*"
+            destination_address_prefix: "*"
+          - name: OpenShift-Udp
+            priority: 1003
+            direction: Inbound
+            access: Allow
+            protocol: Udp
+            source_port_range: "*"
+            destination_port_range:
+              - 53
+              - 8053
+            source_address_prefix: "*"
+            destination_address_prefix: "*"
+        state: present
+      when:
+        - "'instance_nsg' in hostvars[groups['vps'][0]]"
         - "'docker' in services"
         - openshift_dir.stat.exists == False
 
@@ -49,5 +97,18 @@
 
     - name: Close Firewall Ports
       delegate_to: localhost
-      command: bash -c './scripts/firewall.sh close {{ hostvars[groups['vps'][0]].instance }}'
+      args:
+        executable: /bin/bash
+      script: "./scripts/firewall.sh close {{ instance }}"
+      when: "'instance_nsg' not in hostvars[groups['vps'][0]]"
+      tags: [ 'never', 'destroy' ]
+
+    - name: Delete Network Security Group rules
+      delegate_to: localhost
+      command:
+        bash -ic "az-login-sp && (az network nsg rule delete -g {{ resource_group }} --nsg-name {{ network_security_group }} -n {{ item }})"
+      with_items:
+        - OpenShift-Tcp
+        - OpenShift-Udp
+      when: "'instance_nsg' in hostvars[groups['vps'][0]]"
       tags: [ 'never', 'destroy' ]
